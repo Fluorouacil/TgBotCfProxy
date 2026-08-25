@@ -189,6 +189,11 @@ class FailoverAiohttpSession(AiohttpSession):
         self._request_counts: dict[str, int] = {}
         self._switch_count: int = 0
 
+        # Флаг для ленивого запуска автодеплоя.
+        # Реальная asyncio.Task создастся только внутри работающего event loop
+        # при первом вызове make_request().
+        self._auto_fallback_pending: bool = self._auto_fallback
+
     def add_fallback(self, url: str) -> None:
         """Добавить дополнительный fallback-URL. Можно вызывать в любой
         момент — до старта бота или прямо во время работы."""
@@ -222,24 +227,44 @@ class FailoverAiohttpSession(AiohttpSession):
         }
 
     def _maybe_start_auto_fallback(self) -> None:
-        """Запустить автодеплой Worker'а в фоне (не блокируя запросы)."""
-        if not self._auto_fallback or self._auto_fallback_task is not None:
+        """Безопасно запустить автодеплой Worker'а.
+
+        Можно вызывать из __init__ (нет event loop → ставит флаг)
+        и из make_request (есть event loop → создаёт таску один раз).
+        """
+        if not self._auto_fallback_pending:
             return
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            logger.debug(
+                "Автодеплой отложен: нет running event loop. "
+                "Будет запущен при первом запросе."
+            )
+            return
+
+        if self._auto_fallback_task is not None:
+            return
+
+        self._auto_fallback_pending = False
         self._auto_fallback_task = asyncio.create_task(
-            self._deploy_auto_fallback())
+            self._deploy_auto_fallback()
+        )
 
     async def _deploy_auto_fallback(self) -> None:
         """Разворачивает дефолтный Cloudflare Worker (если CF_API_TOKEN /
         CF_ACCOUNT_ID заданы) и добавляет его как базовый fallback."""
-        if not self._cf_api_token or not self._cf_account_id:
-            logger.warning(
-                "auto_fallback включён, но CF_API_TOKEN/CF_ACCOUNT_ID не "
-                "заданы — автодеплой Worker'а пропущен. Работаем только "
-                "с fallback'ами, переданными вручную (если есть)."
-            )
-            return
+        logger.info("🚀 Запуск автодеплоя Cloudflare Worker '%s'...", self._cf_script_name)
 
         try:
+            if not self._cf_api_token or not self._cf_account_id:
+                logger.warning(
+                    "auto_fallback включён, но CF_API_TOKEN/CF_ACCOUNT_ID не заданы — "
+                    "автодеплой пропущен."
+                )
+                return
+
             deployer = CloudflareWorkerDeployer(
                 api_token=self._cf_api_token,
                 account_id=self._cf_account_id,
@@ -251,11 +276,14 @@ class FailoverAiohttpSession(AiohttpSession):
             )
             self.add_fallback(worker_url)
             self._auto_fallback_error = None
-            logger.info("Базовый fallback Worker готов: %s", worker_url)
+            logger.info("✅ Базовый fallback Worker готов: %s", worker_url)
+        except asyncio.CancelledError:
+            logger.warning("⚠️ Автодеплой был отменён (сессия закрыта?)")
+            self._auto_fallback_error = RuntimeError("Deploy task cancelled")
+            raise
         except Exception as exc:
             self._auto_fallback_error = exc
-            logger.error(
-                "Не удалось автоматически задеплоить Worker: %s", exc)
+            logger.error("❌ Не удалось автоматически задеплоить Worker: %s", exc)
 
     def _all_servers(self) -> list[TelegramAPIServer]:
         """Список всех эндпоинтов: primary первым, затем fallback'и."""
@@ -473,16 +501,6 @@ class FailoverAiohttpSession(AiohttpSession):
         method: "TelegramMethod[TelegramType]",
         timeout: Optional[int] = None,
     ) -> TelegramType:
-        """Выполнить запрос к Bot API с автоматическим перебором эндпоинтов:
-        сначала текущий активный, затем остальные по кругу (мёртвые по
-        health-check'у пропускаются, если есть живые). При сетевой ошибке
-        переключается на следующий эндпоинт.
-
-        Особый случай первого запроса: если primary заблокирован, а
-        автодеплой fallback-Worker'а ещё выполняется в фоне (деплой обычно
-        медленнее первого запроса), запрос не падает сразу — мы ждём
-        завершения деплоя (не дольше deploy_wait_timeout) и повторяем
-        запрос уже с готовым fallback'ом."""
         self._maybe_start_auto_fallback()
         await self._maybe_try_recovery()
         await self._maybe_health_check()
@@ -490,12 +508,9 @@ class FailoverAiohttpSession(AiohttpSession):
         try:
             return await self._try_endpoints(bot, method, timeout)
         except _FAILOVER_EXCEPTIONS as exc:
-            # Все эндпоинты упали. Если автодеплой Worker'а ещё в работе —
-            # подождём его (с ограничением) и повторим: к этому моменту
-            # fallback должен появиться в списке. shield() гарантирует, что
-            # при таймауте сама деплой-задача НЕ отменяется и продолжит
-            # работать для следующих запросов.
             task = self._auto_fallback_task
+
+            # Ждём деплой если он ещё идёт
             if task is not None and not task.done():
                 logger.info(
                     "Все эндпоинты недоступны, ждём завершения автодеплоя "
@@ -509,23 +524,48 @@ class FailoverAiohttpSession(AiohttpSession):
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "Автодеплой Worker'а не завершился за %.0f сек — "
-                        "запрос падает, повторный запрос попробует снова",
+                        "Автодеплой Worker'а не завершился за %.0f сек",
                         self._deploy_wait_timeout,
                     )
-                return await self._try_endpoints(bot, method, timeout)
+
+            # Если деплой завершился, но fallback'ов нет — извлекаем ошибку
+            if task is not None and task.done() and not self._fallback_servers:
+                deploy_error = self._auto_fallback_error
+                if deploy_error is None:
+                    try:
+                        task.result()
+                    except Exception as e:
+                        deploy_error = e
+                raise RuntimeError(
+                    f"Primary Bot API недоступен, автодеплой fallback-Worker'а "
+                    f"завершился, но не создал ни одного fallback. "
+                    f"Ошибка: {deploy_error!r}"
+                ) from exc
 
             if self._auto_fallback_error is not None and not self._fallback_servers:
                 raise RuntimeError(
-                    "Primary Bot API недоступен, а автодеплой fallback-Worker'а "
-                    f"провалился: {self._auto_fallback_error!r}"
+                    f"Primary Bot API недоступен, автодеплой провалился: "
+                    f"{self._auto_fallback_error!r}"
                 ) from exc
+
+            if self._fallback_servers:
+                return await self._try_endpoints(bot, method, timeout)
+
             raise
 
     async def close(self) -> None:
         """Закрыть сессию и отменить фоновые задачи."""
         for task in list(self._background_tasks):
             task.cancel()
-        if self._auto_fallback_task is not None:
-            self._auto_fallback_task.cancel()
+
+        if self._auto_fallback_task is not None and not self._auto_fallback_task.done():
+            logger.debug("Ждём завершения автодеплоя перед закрытием сессии...")
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self._auto_fallback_task),
+                    timeout=5.0,
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self._auto_fallback_task.cancel()
+
         await super().close()

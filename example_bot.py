@@ -42,7 +42,7 @@ async def main() -> None:
             # сюда можно дописать свой VPS/WS-прокси как доп. резерв
             # "https://my-vps-proxy.example.com",
         ],
-        request_timeout=8.0,
+        request_timeout=20.0,
         recovery_check_interval=60.0,
     )
 

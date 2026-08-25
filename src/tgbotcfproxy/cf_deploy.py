@@ -109,14 +109,23 @@ class CloudflareWorkerDeployer:
     async def _script_exists(self, session: aiohttp.ClientSession) -> bool:
         """Проверить, существует ли Worker-скрипт с заданным именем.
 
-        Cloudflare API возвращает success: false в JSON даже при 200
-        (например, 403 с телом ошибки), поэтому проверяем оба поля.
+        ВАЖНО: эндпоинт GET .../workers/scripts/{name} возвращает ТЕЛО
+        самого скрипта (Content-Type: multipart/form-data /
+        application/javascript), а НЕ JSON-огибающую — парсить его как
+        JSON нельзя (падает ContentTypeError). Для проверки существования
+        используем metadata-эндпоинт, который возвращает нормальный JSON.
         """
-        url = f"{CF_API_BASE}/accounts/{self._account_id}/workers/scripts/{self._script_name}"
+        url = (
+            f"{CF_API_BASE}/accounts/{self._account_id}/workers/scripts/"
+            f"{self._script_name}/metadata"
+        )
         async with session.get(url, headers=self._auth_header()) as resp:
             if resp.status != 200:
                 return False
-            data = await resp.json()
+            try:
+                data = await resp.json()
+            except Exception:
+                return False
             return bool(data.get("success"))
 
     async def _upload_script(self, session: aiohttp.ClientSession) -> None:
