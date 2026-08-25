@@ -167,6 +167,7 @@ class FailoverAiohttpSession(AiohttpSession):
             "CF_ROUTE_PATTERN")
         self._cf_script_name = cf_script_name
         self._auto_fallback_task: Optional[asyncio.Task] = None
+        self._auto_fallback_error: Optional[BaseException] = None
 
         self._request_timeout = request_timeout
         self._connect_timeout = connect_timeout
@@ -249,8 +250,10 @@ class FailoverAiohttpSession(AiohttpSession):
                 route_pattern=self._cf_route_pattern,
             )
             self.add_fallback(worker_url)
+            self._auto_fallback_error = None
             logger.info("Базовый fallback Worker готов: %s", worker_url)
         except Exception as exc:
+            self._auto_fallback_error = exc
             logger.error(
                 "Не удалось автоматически задеплоить Worker: %s", exc)
 
@@ -486,7 +489,7 @@ class FailoverAiohttpSession(AiohttpSession):
 
         try:
             return await self._try_endpoints(bot, method, timeout)
-        except _FAILOVER_EXCEPTIONS:
+        except _FAILOVER_EXCEPTIONS as exc:
             # Все эндпоинты упали. Если автодеплой Worker'а ещё в работе —
             # подождём его (с ограничением) и повторим: к этому моменту
             # fallback должен появиться в списке. shield() гарантирует, что
@@ -511,6 +514,12 @@ class FailoverAiohttpSession(AiohttpSession):
                         self._deploy_wait_timeout,
                     )
                 return await self._try_endpoints(bot, method, timeout)
+
+            if self._auto_fallback_error is not None and not self._fallback_servers:
+                raise RuntimeError(
+                    "Primary Bot API недоступен, а автодеплой fallback-Worker'а "
+                    f"провалился: {self._auto_fallback_error!r}"
+                ) from exc
             raise
 
     async def close(self) -> None:
