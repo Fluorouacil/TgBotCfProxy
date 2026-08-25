@@ -1,0 +1,21 @@
+[project]
+name = "tgbotcfproxy"
+version = "0.1.0"
+description = "Failover aiohttp session for aiogram with automatic Cloudflare Worker fallback for Telegram Bot API"
+requires-python = ">=3.10"
+dependencies = [
+    "aiogram>=3.0.0",
+    "aiohttp>=3.9.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["tgbotcfproxy*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
