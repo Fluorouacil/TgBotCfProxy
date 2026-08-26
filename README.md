@@ -61,6 +61,72 @@ bot = Bot(token="123:ABC", session=session)
 
 Полный пример бота — в [`example_bot.py`](example_bot.py).
 
+## Получение Cloudflare API Token и Account ID
+
+Для автодеплоя Worker'а библиотеке нужны `CF_API_TOKEN` и `CF_ACCOUNT_ID`.
+
+### Account ID
+
+1. Зайдите в [Cloudflare Dashboard](https://dash.cloudflare.com/).
+2. Если у вас несколько аккаунтов — выберите нужный на странице выбора аккаунта.
+3. Откройте любой домен/сайт в аккаунте (или раздел **Workers & Pages** в
+   левом меню — там Account ID тоже виден).
+4. На главной странице сайта, в правой колонке (**API** блок), либо на
+   странице **Workers & Pages → Overview** справа — будет строка
+   **Account ID** с кнопкой копирования.
+
+Либо через API (если уже есть любой токен с доступом к аккаунту):
+
+```bash
+curl -s -H "Authorization: Bearer $CF_API_TOKEN" \
+  https://api.cloudflare.com/client/v4/accounts | jq .
+```
+
+### API Token
+
+Отдельный от Account ID токен создаётся так:
+
+1. В Dashboard откройте **My Profile** (иконка профиля в правом верхнем углу)
+   → **API Tokens**. Либо напрямую:
+   `https://dash.cloudflare.com/profile/api-tokens`.
+2. Нажмите **Create Token**.
+3. Выберите **Create Custom Token** (не используйте готовые шаблоны — они
+   дают либо слишком узкие, либо слишком широкие права).
+4. Задайте имя токена, например `tgbotcfproxy-deploy`.
+5. В блоке **Permissions** добавьте:
+   - `Account` → `Workers Scripts` → `Edit`
+   - Если планируете использовать `CF_ROUTE_PATTERN` (route на своём домене),
+     дополнительно: `Zone` → `Workers Routes` → `Edit`
+6. В блоке **Account Resources** укажите **Include** → ваш аккаунт (или
+   *All accounts*, если он у вас один).
+7. Если добавляли Zone-права — в блоке **Zone Resources** укажите
+   **Include** → *Specific zone* → нужный домен (или *All zones*).
+8. Ниже, в **Client IP Address Filtering** и **TTL**, можно оставить по
+   умолчанию, либо ограничить по необходимости.
+9. Нажмите **Continue to summary**, проверьте права и нажмите **Create
+   Token**.
+10. Токен показывается **один раз** — сразу скопируйте его и сохраните
+    (например, в `.env`, не в git).
+
+Проверить токен можно так:
+
+```bash
+curl -s -X GET "https://api.cloudflare.com/client/v4/user/tokens/verify" \
+  -H "Authorization: Bearer $CF_API_TOKEN" | jq .
+```
+Ожидаемый ответ — `"status": "active"`.
+
+### Итоговый `.env`
+
+```dotenv
+BOT_TOKEN=123456:AA...
+CF_API_TOKEN=<токен из шага выше>
+CF_ACCOUNT_ID=<Account ID из шага выше>
+# опционально, для route на своём домене
+# CF_ZONE_ID=...
+# CF_ROUTE_PATTERN=proxy.example.com/*
+```
+
 ## Параметры `FailoverAiohttpSession`
 
 | Параметр | По умолчанию | Описание |
